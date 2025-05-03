@@ -50,14 +50,16 @@ namespace x86 {
         }
     };
 
-    enum class eMovType {
+    enum class eInstructionType {
         RegisterMemoryToFromRegister,
         ImmediateToRegisterMemory,
         ImmediateToRegister,
         MemoryToAccumulator,
         AccumulatorToMemory,
         RegisterMemoryToSegmentRegister,
-        SegmentRegisterToRegisterMemory
+        SegmentRegisterToRegisterMemory,
+        RegisterMemoryWithRegisterToEither,
+        ImmediateToAccumulator
     };
     enum class eArchRegister : int8_t {
         Al = 0, Cl = 1, Dl = 2, Bl = 3,
@@ -67,7 +69,7 @@ namespace x86 {
     };
 
     eArchRegister select_reg(std::bitset<3> reg, bool wide) {
-        return eArchRegister(reg.to_ulong() + (wide ? 0 : 1) * reg.to_ulong());
+        return eArchRegister(reg.to_ulong() + (wide ? 0 : 1) * 8);
     }
 
     class Operand {
@@ -222,9 +224,9 @@ namespace x86 {
             uint16_t *dest = select_memory(address);
             *dest = select_register(source.get_register());
         }
-        void mov(eMovType type, Operand destination, Operand source) {
+        void mov(eInstructionType type, Operand destination, Operand source) {
             switch (type) {
-                case eMovType::RegisterMemoryToFromRegister:
+                case eInstructionType::RegisterMemoryToFromRegister:
                 {
                     if (source.get_type() == Operand::eOperandType::Register) {
                         mov_reg_to_reg(destination, source);
@@ -235,7 +237,7 @@ namespace x86 {
                     }
                 }
                 break;
-                case eMovType::ImmediateToRegisterMemory:
+                case eInstructionType::ImmediateToRegisterMemory:
                 {
                     if (destination.get_type() == Operand::eOperandType::Register) {
                         mov_imm_to_reg(destination, source);
@@ -246,30 +248,82 @@ namespace x86 {
                     }
                 }
                 break;
-                case eMovType::ImmediateToRegister:
+                case eInstructionType::ImmediateToRegister:
                 {
                     mov_imm_to_reg(destination, source);
                 }
                 break;
-                case eMovType::MemoryToAccumulator:
+                case eInstructionType::MemoryToAccumulator:
                 {
                     mov_mem_to_reg(destination, source);
                 }
                 break;
-                case eMovType::AccumulatorToMemory: {
+                case eInstructionType::AccumulatorToMemory: {
                     mov_reg_to_mem(destination, source);
                 }
                 break;
-                case eMovType::RegisterMemoryToSegmentRegister: {
+                case eInstructionType::RegisterMemoryToSegmentRegister: {
                     std::logic_error("not implemented");
                 }
                 break;
-                case eMovType::SegmentRegisterToRegisterMemory: {
+                case eInstructionType::SegmentRegisterToRegisterMemory: {
                     std::logic_error("not implemented");
                 }
                 break;
                 default:
                     throw std::logic_error("Unknown mov operation 3");
+            }
+        }
+        void update_flags(uint16_t value) {
+            zero_flag_ = value == 0;
+            sign_flag_ = value & 0x8000;
+        }
+        void add(Operand destination, Operand source) {
+            if (destination.get_type() == Operand::eOperandType::Register
+                && source.get_type() == Operand::eOperandType::Register)
+            {
+                auto &dest = select_register(destination.get_register());
+                auto &src = select_register(source.get_register());
+                dest += src;
+                update_flags(dest);
+            } else {
+                assert(source.get_type() == Operand::eOperandType::Immediate);
+                auto &dest = select_register(destination.get_register());
+                auto src = source.get_memory_or_immediate_s();
+                dest += src;
+                update_flags(dest);
+            }
+        }
+        void cmp(Operand destination, Operand source) {
+            if (destination.get_type() == Operand::eOperandType::Register
+                    && source.get_type() == Operand::eOperandType::Register)
+            {
+                auto &dest = select_register(destination.get_register());
+                auto &src = select_register(source.get_register());
+                auto value = dest - src;
+                update_flags(value);
+            } else {
+                assert(source.get_type() == Operand::eOperandType::Immediate);
+                auto &dest = select_register(destination.get_register());
+                auto src = source.get_memory_or_immediate_u();
+                auto value = dest - src;
+                update_flags(value);
+            }
+        }
+        void sub(Operand destination, Operand source) {
+            if (destination.get_type() == Operand::eOperandType::Register
+                && source.get_type() == Operand::eOperandType::Register)
+            { // reg to reg
+                auto &dest = select_register(destination.get_register());
+                auto &src = select_register(source.get_register());
+                dest -= src;
+                update_flags(dest);
+            } else { // imm to reg
+                assert(source.get_type() == Operand::eOperandType::Immediate);
+                auto &dest = select_register(destination.get_register());
+                auto src = source.get_memory_or_immediate_u();
+                dest -= src;
+                update_flags(dest);
             }
         }
         void set_effective_address_calculation(std::bitset<3> rm, std::bitset<2> mod) {
@@ -284,6 +338,16 @@ namespace x86 {
             pbp = bp;
             psi = si;
             pdi = di;
+            psign_flag_ = sign_flag_;
+            pzero_flag_ = zero_flag_;
+        }
+        std::string flags_str(bool zero_flag, bool sign_flag) {
+            std::string flags_state;
+            if (sign_flag)
+                flags_state += 'S';
+            if (zero_flag)
+                flags_state += 'Z';
+            return flags_state;
         }
         std::string state_change() {
             std::stringstream ss;
@@ -311,18 +375,35 @@ namespace x86 {
             if (di != pdi)
                 ss << "di = 0x" << std::hex << pdi
                    << " -> 0x" << std::hex << di;
+            bool zf_changed = pzero_flag_ != zero_flag_;
+            bool sf_changed = psign_flag_ != sign_flag_;
+            if (zf_changed || sf_changed) {
+                const std::string prev_state = flags_str(pzero_flag_, psign_flag_);
+                const std::string cur_state = flags_str(zero_flag_, sign_flag_);;
+                ss << " flags = " << prev_state << " -> " << cur_state;
+            }
             return ss.str();
         }
         std::string state() {
             std::stringstream ss;
-            ss << '\t' << "ax = 0x" << std::setw(4) << std::setfill('0') << std::hex << ax << '(' << int(ax) << ')' << '\n';
-            ss << '\t' << "bx = 0x" << std::setw(4) << std::setfill('0') << std::hex << bx << '(' << int(bx) << ')' << '\n';
-            ss << '\t' << "cx = 0x" << std::setw(4) << std::setfill('0') << std::hex << cx << '(' << int(cx) << ')' << '\n';
-            ss << '\t' << "dx = 0x" << std::setw(4) << std::setfill('0') << std::hex << dx << '(' << int(dx) << ')' << '\n';
-            ss << '\t' << "sp = 0x" << std::setw(4) << std::setfill('0') << std::hex << sp << '(' << int(sp) << ')' << '\n';
-            ss << '\t' << "bp = 0x" << std::setw(4) << std::setfill('0') << std::hex << bp << '(' << int(bp) << ')' << '\n';
-            ss << '\t' << "si = 0x" << std::setw(4) << std::setfill('0') << std::hex << si << '(' << int(si) << ')' << '\n';
-            ss << '\t' << "di = 0x" << std::setw(4) << std::setfill('0') << std::hex << di << '(' << int(di) << ')';
+            ss << '\t' << "ax = 0x" << std::setw(4) << std::setfill('0') << std::hex << ax
+               << std::dec << '(' << int(ax) << ')' << '\n';
+            ss << '\t' << "bx = 0x" << std::setw(4) << std::setfill('0') << std::hex << bx
+               << std::dec << '(' << int(bx) << ')' << '\n';
+            ss << '\t' << "cx = 0x" << std::setw(4) << std::setfill('0') << std::hex << cx
+               << std::dec << '(' << int(cx) << ')' << '\n';
+            ss << '\t' << "dx = 0x" << std::setw(4) << std::setfill('0') << std::hex << dx
+               << std::dec << '(' << int(dx) << ')' << '\n';
+            ss << '\t' << "sp = 0x" << std::setw(4) << std::setfill('0') << std::hex << sp
+               << std::dec << '(' << int(sp) << ')' << '\n';
+            ss << '\t' << "bp = 0x" << std::setw(4) << std::setfill('0') << std::hex << bp
+               << std::dec << '(' << int(bp) << ')' << '\n';
+            ss << '\t' << "si = 0x" << std::setw(4) << std::setfill('0') << std::hex << si
+               << std::dec << '(' << int(si) << ')' << '\n';
+            ss << '\t' << "di = 0x" << std::setw(4) << std::setfill('0') << std::hex << di
+               << std::dec << '(' << int(di) << ')' << '\n';
+            const std::string cur_state = flags_str(zero_flag_, sign_flag_);;
+            ss << " flags = " << cur_state;
             return ss.str();
         }
     private:
@@ -330,6 +411,10 @@ namespace x86 {
         uint16_t pax{}, pbx{}, pcx{}, pdx{}, psp{}, pbp{}, psi{}, pdi{};
         Memory &memory_;
         eEffectiveAddressCalculation eac_;
+        bool sign_flag_ = false;
+        bool zero_flag_ = false;
+        bool psign_flag_ = false;
+        bool pzero_flag_ = false;
     };
 
     template<typename T>
@@ -606,7 +691,7 @@ namespace x86 {
         bs >> w;
         const auto reg = bs.read<3>();
         uint8_t lo = bs.read<8>().to_ulong();
-        eMovType mov_type = eMovType::ImmediateToRegister;
+        eInstructionType mov_type = eInstructionType::ImmediateToRegister;
         Operand dest_op, source_op;
         dest_op.set_type(Operand::eOperandType::Register);
         dest_op.set_register(reg, w);
@@ -655,7 +740,7 @@ namespace x86 {
         mod = bs.read<2>();
         reg = bs.read<3>();
         rm = bs.read<3>();
-        eMovType mov_type = eMovType::RegisterMemoryToFromRegister;;
+        eInstructionType mov_type = eInstructionType::RegisterMemoryToFromRegister;;
         Operand destination_op, source_op;
         if (mod.to_ulong() == 0b11) { // reg to reg
             const char *source = d ? get_register_name(rm, w) : get_register_name(reg, w);
@@ -713,7 +798,16 @@ namespace x86 {
         {
             cpu.remember_prev_state();
             cpu.set_effective_address_calculation(rm, mod);
-            cpu.mov(mov_type, destination_op, source_op);
+            if (node->name == "mov") {
+                cpu.mov(mov_type, destination_op, source_op);
+            } else if (node->name == "add") {
+                cpu.add(destination_op, source_op);
+            } else if (node->name == "cmp") {
+                cpu.cmp(destination_op, source_op);
+            } else if (node->name == "sub") {
+                cpu.sub(destination_op, source_op);
+            }
+
             std::cout << " ; " << cpu.state_change();
         }
         std::cout << std::endl;
@@ -793,34 +887,43 @@ namespace x86 {
         bs >> w;
         mod = bs.read<2>();
         reg = bs.read<3>(); // always 000 for add
-
         rm = bs.read<3>();
         int16_t possible_data = 0;
         int16_t possible_displacement = 0;
+
+        Operand destination_op, source_op;
         if (mod.to_ulong() == 0b01) {
             possible_displacement = int8_t(bs.read<8>().to_ulong());
+            destination_op.set_type(Operand::eOperandType::Memory);
+            destination_op.set_mem_or_imm(possible_displacement, false);
         } else if (mod.to_ulong() == 0b10 || (mod.to_ulong() == 0 && rm.to_ulong() == 0b110)) {
             possible_displacement = int16_t(bs.read<8>().to_ulong() | bs.read<8>().to_ulong() << 8);
+            destination_op.set_type(Operand::eOperandType::Memory);
+            destination_op.set_mem_or_imm(possible_displacement, true);
         }
         if (!s && w) {
             possible_data = int16_t(bs.read<8>().to_ulong() | bs.read<8>().to_ulong() << 8);
+            source_op.set_mem_or_imm(possible_data, true);
+            source_op.set_type(Operand::eOperandType::Immediate);
         } else {
             possible_data = int8_t(bs.read<8>().to_ulong());
+            source_op.set_mem_or_imm(possible_data, false);
+            source_op.set_type(Operand::eOperandType::Immediate);
         }
         if (mod.to_ulong() == 0b11) {
             if (s) {
                 int16_t sign_extend = possible_data;
                 std::cout << get_op_name(reg) << ' ' << get_register_name(rm, w)
                           << ", "
-                          << int(sign_extend)
-                          << std::endl;
+                          << int(sign_extend);
             } else {
                 uint16_t sign_extend = possible_data;
                 std::cout << get_op_name(reg) << ' ' << get_register_name(rm, w)
                           << ", "
-                          << int(sign_extend)
-                          << std::endl;
+                          << int(sign_extend);
             }
+            destination_op.set_type(Operand::eOperandType::Register);
+            destination_op.set_register(rm, w);
         } else {
             std::cout << get_op_name(reg)
                       << (w ? " word" : " byte")
@@ -836,10 +939,19 @@ namespace x86 {
                               << ' ' << std::abs(possible_displacement);
                 }
             }
-            std::cout << "], "
-                      << possible_data
-                      << std::endl;
+            std::cout << "], " << possible_data;
         }
+        {
+            cpu.remember_prev_state();
+            cpu.set_effective_address_calculation(rm, mod);
+            switch (reg.to_ulong()) {
+                case 0b000: cpu.add(destination_op, source_op); break;
+                case 0b101: cpu.sub(destination_op, source_op); break;
+                case 0b111: cpu.cmp(destination_op, source_op); break;
+            }
+            std::cout << " ; " << cpu.state_change();
+        }
+        std::cout << std::endl;
     }
     void conditional_jump(BinTrie::Node *node, BinStream &bs, CPU& cpu, void *data) {
         std::cout << node->name << ' ' << int(bs.read<8>().to_ulong()) << std::endl;
