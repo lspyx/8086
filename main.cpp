@@ -14,16 +14,77 @@
 #include <iomanip>
 
 namespace x86 {
+    class IterableByte {
+    public:
+        IterableByte(uint8_t val) : value(val) {}
+        IterableByte &operator>>(bool &output) {
+            if (idex >= 8) {
+                return *this;
+            }
+            output = (value >> idex--) & 1;
+            return *this;
+        }
+        template<int N>
+        std::bitset<N> read_bits() {
+            std::bitset<N> bitset;
+            for (int i = N - 1; i >= 0; i--) {
+                bool res;
+                *this >> res;
+                bitset[i] = res;
+            }
+            return bitset;
+        }
+        void skip_bits(int n) {
+            if (n < 0)
+                throw std::invalid_argument("");
+            idex -= n;
+        }
+    private:
+        uint8_t value = 0;
+        int8_t idex = 7;
+    };
+    class IterableWord {
+    public:
+        IterableWord(uint16_t val) {
+            value = (val << 8) | (val >> 8);
+        }
+        IterableWord &operator>>(bool &output) {
+            if (idex < 0) {
+                return *this;
+            }
+            output = (value >> idex--) & 1;
+            return *this;
+        }
+        template<int N>
+        std::bitset<N> read_bits() {
+            std::bitset<N> bitset;
+            for (int i = N - 1; i >= 0; i--) {
+                bool res;
+                *this >> res;
+                bitset[i] = res;
+            }
+            return bitset;
+        }
+        void skip_bits(int n) {
+            if (n < 0)
+                throw std::invalid_argument("");
+            idex -= n;
+        }
+    private:
+        uint16_t value = 0;
+        int8_t idex = 15;
+    };
+
     class Memory {
     public:
         Memory() = default;
         explicit Memory(const std::string &input_file)
         : size_(load_input_file(input_file, buffer_))
         {}
-        uint16_t get_word(uint16_t address) const {
-            return buffer_[address];
+        IterableWord get_word(uint16_t address) const {
+            return IterableWord{*reinterpret_cast<const uint16_t*>(&buffer_[address])};
         }
-        uint8_t get_byte(uint16_t address) const {
+        IterableByte get_byte(uint16_t address) const {
             return buffer_[address];
         }
         uint8_t *get_byte_mod(uint16_t address) {
@@ -31,6 +92,19 @@ namespace x86 {
         }
         size_t get_size() const {
             return size_;
+        }
+        friend
+        std::ostream &operator<<(std::ostream& os, const Memory &mem) {
+            for (int i = 0; i < mem.size_; i += 2) {
+                auto one = mem.get_byte(i).read_bits<8>();
+                os << "0x" << std::hex << std::setfill('0') << std::setw(4) << i << " :: "
+                   << "0b" << one << ' ';
+                auto two = mem.get_byte(i + 1).read_bits<8>();
+                os << "0b" << two << ' ';
+                os << "0x" << std::hex << one.to_ulong() << " 0x" << two.to_ulong() << std::endl;
+            }
+            os << std::dec;
+            return os;
         }
     private:
         char buffer_[256*256] = {0};
@@ -95,7 +169,7 @@ namespace x86 {
         Operand(eOperandType type) : type_(type) {}
         void set_register(std::bitset<3> reg, bool w) {
             register_ = select_reg(reg, w);
-            wide = int(register_) < 8;
+            wide = w;
         }
         void set_mem_or_imm(uint16_t value, bool w) {
             memory_or_immediate_ = value;
@@ -154,11 +228,188 @@ namespace x86 {
         BPplusD16 = 22,
         BXplusD16 = 23,
     };
+
+    class CPU;
+    class BinTrie {
+    public:
+        struct Node;
+        using function_t = void (*)(
+                Node *caller,
+                CPU& cpu,
+                void *);
+        void set_cpu(CPU *cpu) {
+            cpu_ = cpu;
+        }
+        struct Node {
+            int opcode_bitsize;
+            std::string name;
+            std::string tag; // comment
+            function_t function = nullptr;
+            Node *children[2] = {};
+        };
+        template<size_t opcode_bitlength>
+        void add(std::bitset<opcode_bitlength> bits,
+                 const std::string &name,
+                 const std::string &tag,
+                 function_t function)
+        {
+            if (!sentinel_.children[0]) {
+                sentinel_.children[0] = new Node;
+            }
+            Node *ptr = sentinel_.children[0];
+            for (int i = opcode_bitlength - 1; i >= 0; i--) {
+                const int value = bits[i] ? 1 : 0;
+                if (!ptr->children[value]) {
+                    ptr->children[value] = new Node();
+                }
+                ptr = ptr->children[value];
+            }
+            if (ptr->function)
+                throw std::invalid_argument("can't reset already set functions");
+            ptr->function = function;
+            ptr->name = name;
+            ptr->tag = tag;
+            ptr->opcode_bitsize = bits.size();
+        }
+        template<size_t opcode_bitlength>
+        void call(std::bitset<opcode_bitlength> bits, void *data = nullptr) {
+            Node *ptr = sentinel_.children[0];
+            for (int i = opcode_bitlength - 1; i >= 0; i--) {
+                const int value = bits[i] ? 1 : 0;
+                if (!ptr->children[value])
+                    throw std::out_of_range("no function at this opcode");
+                ptr = ptr->children[value];
+            }
+            if (!ptr->function)
+                throw std::out_of_range("no function at this opcode");
+            ptr->function(ptr, *cpu_, data);
+        }
+        bool process_next_instruction(Memory &memory, uint16_t ip, void *data) {
+            std::vector<bool> history;
+            Node *ptr = sentinel_.children[0];
+            auto word = memory.get_word(ip);
+            if (ip >= memory.get_size())
+                return false;
+            while (true) {
+                bool value = false;
+                word >> value;
+                history.push_back(value);
+                if (!ptr->children[value])
+                    throw std::out_of_range("no function at this opcode");
+                ptr = ptr->children[value];
+                if (ptr->function) {
+//                    std::cout << "IP=0x" << std::setw(4) << std::setfill('0') << ip
+//                              << std::dec << " Instruction opcode 0b";
+//                    for (const auto &el : history) {
+//                        std::cout << el;
+//                    }
+//                    std::cout << std::endl;
+                    ptr->function(ptr, *cpu_, data);
+                    return true;
+                }
+            }
+        }
+    private:
+        CPU *cpu_;
+        Node sentinel_;
+    };
+
+    struct Flags {
+        bool cf = false;
+        bool zf = false;
+        bool sf = false;
+        bool of = false;
+        bool pf = false;
+        bool af = false;
+        std::string str() const {
+            std::string s;
+            if (cf) s += 'C';
+            if (zf) s += 'Z';
+            if (sf) s += 'S';
+            if (of) s += 'O';
+            if (pf) s += 'P';
+            if (af) s += 'A';
+            return s;
+        }
+
+        bool get_cf() const {
+            return cf;
+        }
+
+        void set_cf(bool cf) {
+            Flags::cf = cf;
+        }
+
+        bool get_zf() const {
+            return zf;
+        }
+
+        void set_zf(bool zf) {
+            Flags::zf = zf;
+        }
+
+        bool get_sf() const {
+            return sf;
+        }
+
+        void set_sf(bool sf) {
+            Flags::sf = sf;
+        }
+
+        bool get_of() const {
+            return of;
+        }
+
+        void set_of(bool of) {
+            Flags::of = of;
+        }
+
+        bool get_pf() const {
+            return pf;
+        }
+
+        void set_pf(bool pf) {
+            Flags::pf = pf;
+        }
+
+        bool get_af() const {
+            return af;
+        }
+
+        void set_af(bool af) {
+            Flags::af = af;
+        }
+    };
+
+    int calculate_parity(uint8_t value) {
+        int set_bits = 0;
+        for (int i = 0; i < 8; ++i) {
+            if ((value >> i) & 1) {
+                set_bits++;
+            }
+        }
+        return (set_bits % 2 == 0); // 1 если четное, 0 если нечетное
+    }
+
     class CPU {
     public:
-        CPU() = default;
+        uint16_t get_cx() const {
+            return cx;
+        }
+        void set_cx(uint16_t new_value) {
+            cx = new_value;
+        }
+        const Flags & get_flags() const {
+            return flags;
+        }
+        void execute() {
+            bool proceed = true;
+            while (proceed) {
+                proceed = isa_.process_next_instruction(memory_, ip, nullptr);
+            }
+        }
         CPU(Memory& memory) : memory_(memory) {
-
+            isa_.set_cpu(this);
         }
         ~CPU() {
             std::cout << "Final Register State:\n";
@@ -274,9 +525,32 @@ namespace x86 {
                     throw std::logic_error("Unknown mov operation 3");
             }
         }
-        void update_flags(uint16_t value) {
-            zero_flag_ = value == 0;
-            sign_flag_ = value & 0x8000;
+        void update_flags(bool add, uint16_t dest, uint16_t src) {
+            if (add) {
+                uint32_t full_result = (uint32_t)dest + src;
+                uint16_t res = full_result;
+                flags.set_zf(res == 0);
+                flags.set_sf(res & 0x8000);
+                flags.set_pf(calculate_parity(uint8_t(res)));
+                flags.set_cf(full_result > 0xffff);
+                flags.set_af((dest & 0x0f) + (src & 0x0f) > 0x0f);
+                bool sign_dest = (dest & 0x8000);
+                bool sign_src = (src & 0x8000);
+                bool sign_res = (res & 0x8000);
+                flags.set_of((sign_dest == sign_src) && (sign_res != sign_dest));
+            } else {
+                uint32_t full_result = (uint32_t)dest - src;
+                uint16_t res = full_result;
+                flags.set_zf(res == 0);
+                flags.set_sf(res & 0x8000);
+                flags.set_pf(calculate_parity(uint8_t(res)));
+                flags.set_cf(src > dest);
+                flags.set_af((dest & 0x0f) < (src & 0x0f));
+                bool sign_dest = (dest & 0x8000);
+                bool sign_src = (src & 0x8000);
+                bool sign_res = (res & 0x8000);
+                flags.set_of((sign_dest != sign_src) && (sign_res != sign_dest));
+            }
         }
         void add(Operand destination, Operand source) {
             if (destination.get_type() == Operand::eOperandType::Register
@@ -284,14 +558,14 @@ namespace x86 {
             {
                 auto &dest = select_register(destination.get_register());
                 auto &src = select_register(source.get_register());
+                update_flags(true, dest, src);
                 dest += src;
-                update_flags(dest);
             } else {
                 assert(source.get_type() == Operand::eOperandType::Immediate);
                 auto &dest = select_register(destination.get_register());
                 auto src = source.get_memory_or_immediate_s();
+                update_flags(true, dest, src);
                 dest += src;
-                update_flags(dest);
             }
         }
         void cmp(Operand destination, Operand source) {
@@ -300,14 +574,12 @@ namespace x86 {
             {
                 auto &dest = select_register(destination.get_register());
                 auto &src = select_register(source.get_register());
-                auto value = dest - src;
-                update_flags(value);
+                update_flags(false, dest, src);
             } else {
                 assert(source.get_type() == Operand::eOperandType::Immediate);
                 auto &dest = select_register(destination.get_register());
                 auto src = source.get_memory_or_immediate_u();
-                auto value = dest - src;
-                update_flags(value);
+                update_flags(false, dest, src);
             }
         }
         void sub(Operand destination, Operand source) {
@@ -316,14 +588,14 @@ namespace x86 {
             { // reg to reg
                 auto &dest = select_register(destination.get_register());
                 auto &src = select_register(source.get_register());
+                update_flags(false, dest, src);
                 dest -= src;
-                update_flags(dest);
             } else { // imm to reg
                 assert(source.get_type() == Operand::eOperandType::Immediate);
                 auto &dest = select_register(destination.get_register());
                 auto src = source.get_memory_or_immediate_u();
+                update_flags(false, dest, src);
                 dest -= src;
-                update_flags(dest);
             }
         }
         void set_effective_address_calculation(std::bitset<3> rm, std::bitset<2> mod) {
@@ -338,8 +610,8 @@ namespace x86 {
             pbp = bp;
             psi = si;
             pdi = di;
-            psign_flag_ = sign_flag_;
-            pzero_flag_ = zero_flag_;
+            pflags = flags;
+            pip = ip;
         }
         std::string flags_str(bool zero_flag, bool sign_flag) {
             std::string flags_state;
@@ -348,6 +620,12 @@ namespace x86 {
             if (zero_flag)
                 flags_state += 'Z';
             return flags_state;
+        }
+        bool get_zero_flag() const {
+            return flags.get_zf();
+        }
+        bool get_sign_flag() const {
+            return flags.get_sf();
         }
         std::string state_change() {
             std::stringstream ss;
@@ -375,13 +653,16 @@ namespace x86 {
             if (di != pdi)
                 ss << "di = 0x" << std::hex << pdi
                    << " -> 0x" << std::hex << di;
-            bool zf_changed = pzero_flag_ != zero_flag_;
-            bool sf_changed = psign_flag_ != sign_flag_;
+            bool zf_changed = pflags.get_zf() != flags.get_zf();
+            bool sf_changed = pflags.get_sf() != flags.get_sf();
             if (zf_changed || sf_changed) {
-                const std::string prev_state = flags_str(pzero_flag_, psign_flag_);
-                const std::string cur_state = flags_str(zero_flag_, sign_flag_);;
-                ss << " flags = " << prev_state << " -> " << cur_state;
+                const std::string prev_state = pflags.str();
+                const std::string cur_state = flags.str();
+                ss << " flags = " << prev_state << " -> " << cur_state << ';';
             }
+            if (ip != pip)
+                ss << " ip = 0x" << std::hex << pip
+                   << " -> 0x" << std::hex << ip;
             return ss.str();
         }
         std::string state() {
@@ -402,19 +683,34 @@ namespace x86 {
                << std::dec << '(' << int(si) << ')' << '\n';
             ss << '\t' << "di = 0x" << std::setw(4) << std::setfill('0') << std::hex << di
                << std::dec << '(' << int(di) << ')' << '\n';
-            const std::string cur_state = flags_str(zero_flag_, sign_flag_);;
-            ss << " flags = " << cur_state;
+            ss << '\t' << "ip = " << std::setw(4) << std::setfill('0') << std::hex << ip
+               << std::dec << '(' << int(ip) << ')' << '\n';
+            const std::string cur_state = flags.str();
+            ss << "\tflags = " << cur_state;
             return ss.str();
         }
+        uint16_t get_ip() {
+            return ip;
+        }
+        void set_ip(uint16_t address) {
+            ip = address;
+        }
+        Memory &get_memory() {
+            return memory_;
+        }
+        BinTrie &get_isa() {
+            return isa_;
+        }
     private:
+        uint16_t ip = 0;
         uint16_t ax{}, bx{}, cx{}, dx{}, sp{}, bp{}, si{}, di{};
         uint16_t pax{}, pbx{}, pcx{}, pdx{}, psp{}, pbp{}, psi{}, pdi{};
+        uint16_t pip = 0;
         Memory &memory_;
         eEffectiveAddressCalculation eac_;
-        bool sign_flag_ = false;
-        bool zero_flag_ = false;
-        bool psign_flag_ = false;
-        bool pzero_flag_ = false;
+        Flags pflags, flags;
+        BinTrie isa_;
+
     };
 
     template<typename T>
@@ -438,225 +734,8 @@ namespace x86 {
         res += arr[int(low)];
         return res;
     }
-    class BinStream {
-    public:
-        void init(Memory mem, std::size_t length_bytes) {
-            idex_ = 0;
-            buff_ = std::vector<bool>(length_bytes * 8);
-            for (ssize_t i = length_bytes - 1; i >= 0; i--) {
-                auto b = static_cast<std::byte>(mem.get_byte(i));
-                for (int j = 0; j < 8; j++) {
-                    buff_[i*8 + 7 - j] = static_cast<bool>(b & (std::byte(1) << j));
-                }
-            }
-            eof_ = false;
-        }
-        void init(const Pointerable auto *ptr, std::size_t length_bytes) {
-            idex_ = 0;
-            buff_ = std::vector<bool>(length_bytes * 8);
-            for (ssize_t i = length_bytes - 1; i >= 0; i--) {
-                auto b = static_cast<const std::byte>(*((std::byte*)ptr + i));
-                for (int j = 0; j < 8; j++) {
-                    buff_[i*8 + 7 - j] = static_cast<bool>(b & (std::byte(1) << j));
-                }
-            }
-            eof_ = false;
-        }
-        void insert(const char *str, std::size_t length = std::numeric_limits<std::size_t>::max()) {
-            const char *p = str;
-            int len = 0;
-            constexpr char ascii_zero_char_pos = 48;
-            if (length != std::numeric_limits<std::size_t>::max())
-                buff_.reserve(length);
-            do {
-                if (length == len)
-                    break;
-                const char val = static_cast<char>(*p) - ascii_zero_char_pos;
-                if (val != 0 && val != 1)
-                    throw std::invalid_argument("the input string contains characters other than zeroes and ones");
-                buff_.push_back(static_cast<bool>(val));
-                len++;
-            } while (*++p);
-            if (len)
-                eof_ = false;
-        }
-        BinStream &operator<<(const char *str) {
-            insert(str);
-            return *this;
-        }
-        BinStream &operator<<(const std::string &str) {
-            insert(str.c_str(), str.size());
-            return *this;
-        }
-        BinStream &operator<<(Integral auto val) {
-            if (val != 0 && val != 1)
-                throw std::invalid_argument("the input is not zero or one");
-            buff_.push_back(val);
-        }
-        BinStream &operator>>(bool &output) {
-            if (eof_) {
-                return *this;
-            }
-            output = buff_[idex_++];
-            if (idex_ >= buff_.size()) {
-                eof_ = true;
-            }
-            return *this;
-        }
-        BinStream &operator>>(Integral auto &output) {
-            if (eof_) {
-                return *this;
-            }
-            output = std::remove_reference_t<decltype(output)>(buff_[idex_++]);
-            if (idex_ >= buff_.size()) {
-                eof_ = true;
-            }
-            return *this;
-        }
-        operator bool() const {
-            return !eof_;
-        }
-        size_t size() const {
-            return buff_.size();
-        }
-        template<int N>
-        std::bitset<N> read() {
-            std::bitset<N> bitset;
-            for (int i = N - 1; i >= 0; i--) {
-                int res;
-                *this >> res;
-                bitset[i] = res;
-            }
-            return bitset;
-        }
-    private:
-        std::vector<bool> buff_;
-        std::size_t idex_ = 0;
-        bool eof_ = true;
-    };
-
-    class BinTrie {
-    public:
-        explicit BinTrie(CPU &cpu) : cpu_(cpu) {}
-        struct Node;
-        using function_t = void (*)(
-                Node *caller,
-                BinStream &bin_stream,
-                CPU& cpu,
-                void *);
-        struct Node {
-            std::string name;
-            std::string tag; // comment
-            function_t function = nullptr;
-            Node *children[2] = {};
-        };
-        template<size_t opcode_bitlength>
-        void add(std::bitset<opcode_bitlength> bits,
-                 const std::string &name,
-                 const std::string &tag,
-                 function_t function)
-        {
-            if (!sentinel_.children[0]) {
-                sentinel_.children[0] = new Node;
-            }
-            Node *ptr = sentinel_.children[0];
-            for (int i = opcode_bitlength - 1; i >= 0; i--) {
-                const int value = bits[i] ? 1 : 0;
-                if (!ptr->children[value]) {
-                    ptr->children[value] = new Node();
-                }
-                ptr = ptr->children[value];
-            }
-            if (ptr->function)
-                throw std::invalid_argument("can't reset already set functions");
-            ptr->function = function;
-            ptr->name = name;
-            ptr->tag = tag;
-        }
-        template<size_t opcode_bitlength>
-        void call(std::bitset<opcode_bitlength> bits, BinStream &bs, void *data = nullptr) {
-            Node *ptr = sentinel_.children[0];
-            for (int i = opcode_bitlength - 1; i >= 0; i--) {
-                const int value = bits[i] ? 1 : 0;
-                if (!ptr->children[value])
-                    throw std::out_of_range("no function at this opcode");
-                ptr = ptr->children[value];
-            }
-            if (!ptr->function)
-                throw std::out_of_range("no function at this opcode");
-            ptr->function(ptr, bs, cpu_, data);
-        }
-        void process_next_instruction(BinStream &bs, void *data) {
-            Node *ptr = sentinel_.children[0];
-            while (true) {
-                int value = 0;
-                bs >> value;
-                if (!ptr->children[value])
-                    throw std::out_of_range("no function at this opcode");
-                ptr = ptr->children[value];
-                if (ptr->function) {
-                    ptr->function(ptr, bs, cpu_, data);
-                    return;
-                }
-            }
-        }
-    private:
-        CPU &cpu_;
-        Node sentinel_;
-    };
-
-    namespace tests {
-        void test_binstream() {
-            BinStream bs;
-            const char *str = "010101010101";
-            const size_t size = strlen(str);
-            bs << str;
-            int i = 0;
-            for (; i < size; i++) {
-                int val = 0;
-                bs >> val;
-                if (bs && str[i] - 48 != val)
-                    throw std::runtime_error("error!");
-            }
-            const int64_t bin_value = 1365;
-            const size_t bin_value_size = sizeof(bin_value);
-            bs.init(&bin_value, bin_value_size);
-            for (i = 0; i < 52; i++) {
-                int val = 0;
-                bs >> val;
-                if (bs && 0 != val)
-                    throw std::runtime_error("error!");
-            }
-            for (i = 0; i < size; i++) {
-                int val = 0;
-                bs >> val;
-                if (bs && str[i] - 48 != val)
-                    throw std::runtime_error("error!");
-            }
-        }
 
 
-        namespace detail {
-            void test_function(BinTrie::Node *node, BinStream &bs, CPU &cpu, void *data) {
-                std::cout << "success" << std::endl;
-            }
-        }
-        void test_bin_trie() {
-            BinStream bs;
-            std::bitset<12> bits{010101010101};
-            Memory mem;
-            CPU cpu(mem);
-            BinTrie bt(cpu);
-            bt.add(bits, "test", "test", detail::test_function);
-            bt.call(bits, bs, nullptr);
-            bits.flip(0);
-            try {
-                bt.call(bits, bs, nullptr);
-            } catch (...) {
-                std::cout << "success 2" << std::endl;
-            }
-        };
-    }
 
     const char *get_register_name(std::bitset<3> enc_reg, bool w) {
         const uint8_t reg = enc_reg.to_ulong();
@@ -686,18 +765,24 @@ namespace x86 {
         }
     }
 
-    void imm_to_register_move(BinTrie::Node *node, BinStream &bs, CPU& cpu, void *data) {
+    void imm_to_register_move(BinTrie::Node *node, CPU& cpu, void *data) {
+        Memory &mem = cpu.get_memory();
+        auto word = mem.get_word(cpu.get_ip());
+        int ip_offset = 2;
+        word.skip_bits(node->opcode_bitsize);
         bool w;
-        bs >> w;
-        const auto reg = bs.read<3>();
-        uint8_t lo = bs.read<8>().to_ulong();
+        word >> w;
+        const auto reg = word.read_bits<3>();
+        uint8_t lo = word.read_bits<8>().to_ulong();
         eInstructionType mov_type = eInstructionType::ImmediateToRegister;
         Operand dest_op, source_op;
         dest_op.set_type(Operand::eOperandType::Register);
         dest_op.set_register(reg, w);
         source_op.set_type(Operand::eOperandType::Immediate);
         if (w) {
-            uint8_t hi = bs.read<8>().to_ulong();
+            auto byte = mem.get_word(cpu.get_ip() + 2);
+            uint8_t hi = byte.read_bits<8>().to_ulong();
+            ip_offset++;
             const int16_t value = static_cast<int16_t>(hi) << 8 | static_cast<int16_t>(lo);
             std::cout << node->name << ' ' << get_register_name(reg, w) << ", " << int16_t(value);
             source_op.set_mem_or_imm(value, true);
@@ -707,6 +792,7 @@ namespace x86 {
         }
         {
             cpu.remember_prev_state();
+            cpu.set_ip(cpu.get_ip() + ip_offset);
             cpu.mov(mov_type, dest_op, source_op);
             std::cout << " ; " << cpu.state_change();
         }
@@ -730,16 +816,19 @@ namespace x86 {
         res += effective_address_calc_rm[rm.to_ulong()];
         return res;
     }
-    void register_memory_to_from_register(BinTrie::Node *node, BinStream &bs, CPU& cpu, void *data) {
-        // MOV
+    void register_memory_to_from_register(BinTrie::Node *node, CPU& cpu, void *data) {
+        auto &mem = cpu.get_memory();
+        auto word = mem.get_word(cpu.get_ip());
+        int ip_offset = 2;
+        word.skip_bits(node->opcode_bitsize);
         bool d, w;
         std::bitset<2> mod;
         std::bitset<3> reg, rm;
-        bs >> d; // 0->source in REG, 1->dest in REG
-        bs >> w; // 0->byte, 1->word
-        mod = bs.read<2>();
-        reg = bs.read<3>();
-        rm = bs.read<3>();
+        word >> d; // 0->source in REG, 1->dest in REG
+        word >> w; // 0->byte, 1->word
+        mod = word.read_bits<2>();
+        reg = word.read_bits<3>();
+        rm = word.read_bits<3>();
         eInstructionType mov_type = eInstructionType::RegisterMemoryToFromRegister;;
         Operand destination_op, source_op;
         if (mod.to_ulong() == 0b11) { // reg to reg
@@ -761,10 +850,14 @@ namespace x86 {
             int16_t possible_displacement = 0;
             source_op.set_type(Operand::eOperandType::Memory);
             if (mod.to_ulong() == 0b01) {
-                possible_displacement = int8_t(bs.read<8>().to_ulong());
+                auto byte = mem.get_byte(cpu.get_ip() + 2);
+                ip_offset++;
+                possible_displacement = int8_t(byte.read_bits<8>().to_ulong());
                 source_op.set_mem_or_imm(possible_displacement, false);
             } else if (mod.to_ulong() == 0b10 || (mod.to_ulong() == 0 && rm.to_ulong() == 0b110)) {
-                possible_displacement = int16_t(bs.read<8>().to_ulong() | bs.read<8>().to_ulong() << 8);
+                word = mem.get_word(cpu.get_ip() + 2);
+                ip_offset += 2;
+                possible_displacement = int16_t(word.read_bits<8>().to_ulong() | word.read_bits<8>().to_ulong() << 8);
                 source_op.set_mem_or_imm(possible_displacement, true);
             }
             if (d) { // load: mov ax, [86]
@@ -797,6 +890,7 @@ namespace x86 {
         }
         {
             cpu.remember_prev_state();
+            cpu.set_ip(cpu.get_ip() + ip_offset);
             cpu.set_effective_address_calculation(rm, mod);
             if (node->name == "mov") {
                 cpu.mov(mov_type, destination_op, source_op);
@@ -807,31 +901,42 @@ namespace x86 {
             } else if (node->name == "sub") {
                 cpu.sub(destination_op, source_op);
             }
-
             std::cout << " ; " << cpu.state_change();
         }
         std::cout << std::endl;
     }
 
-    void imm_to_register_memory_move(BinTrie::Node *node, BinStream &bs, CPU& cpu, void *data) {
+    void imm_to_register_memory_move(BinTrie::Node *node, CPU& cpu, void *data) {
+        auto &mem = cpu.get_memory();
+        auto word = mem.get_word(cpu.get_ip());
+        word.skip_bits(node->opcode_bitsize);
+        int ip_offset = 2;
         bool w;
         std::bitset<2> mod;
         std::bitset<3> reg, rm;
-        bs >> w;
-        mod = bs.read<2>();
-        reg = bs.read<3>(); // always 000
-        rm = bs.read<3>();
+        word >> w;
+        mod = word.read_bits<2>();
+        reg = word.read_bits<3>(); // always 000
+        rm = word.read_bits<3>();
         int16_t possible_data = 0;
         int16_t possible_displacement = 0;
         if (mod.to_ulong() == 0b01) {
-            possible_displacement = int8_t(bs.read<8>().to_ulong());
+            auto byte = mem.get_byte(cpu.get_ip() + ip_offset);
+            ip_offset++;
+            possible_displacement = int8_t(byte.read_bits<8>().to_ulong());
         } else if (mod.to_ulong() == 0b10 || (mod.to_ulong() == 0 && rm.to_ulong() == 0b110)) {
-            possible_displacement = int16_t(bs.read<8>().to_ulong() | bs.read<8>().to_ulong() << 8);
+            word = mem.get_word(cpu.get_ip() + ip_offset);
+            ip_offset += 2;
+            possible_displacement = int16_t(word.read_bits<8>().to_ulong() | word.read_bits<8>().to_ulong() << 8);
         }
         if (w) {
-            possible_data = int16_t(bs.read<8>().to_ulong() | bs.read<8>().to_ulong() << 8);
+            word = mem.get_word(cpu.get_ip() + ip_offset);
+            ip_offset += 2;
+            possible_data = int16_t(word.read_bits<8>().to_ulong() | word.read_bits<8>().to_ulong() << 8);
         } else {
-            possible_data = int8_t(bs.read<8>().to_ulong());
+            auto byte = mem.get_byte(cpu.get_ip() + ip_offset);
+            ip_offset++;
+            possible_data = int8_t(byte.read_bits<8>().to_ulong());
         }
         std::cout << node->name
                   << " ["
@@ -845,30 +950,46 @@ namespace x86 {
                   << (w ? "word " : "byte ")
                   << possible_data
                   << std::endl;
+        cpu.set_ip(cpu.get_ip() + ip_offset);
     }
 
-    void accumulator_to_memory(BinTrie::Node *node, BinStream &bs, CPU& cpu, void *data) {
+    void accumulator_to_memory(BinTrie::Node *node, CPU& cpu, void *data) {
+        auto &mem = cpu.get_memory();
+        auto word = mem.get_word(cpu.get_ip());
+        word.skip_bits(node->opcode_bitsize);
         bool w;
-        bs >> w;
-        uint16_t address = uint16_t(bs.read<8>().to_ulong() | bs.read<8>().to_ulong() << 8);
+        word >> w;
+        uint16_t address = uint16_t(word.read_bits<8>().to_ulong() |
+                mem.get_byte(cpu.get_ip() + 2).read_bits<8>().to_ulong() << 8);
         std::cout << node->name << " [" << address << "], ax" << std::endl;
+        cpu.set_ip(cpu.get_ip() + 3);
     }
 
-    void memory_to_accumulator(BinTrie::Node *node, BinStream &bs, CPU& cpu, void *data) {
+    void memory_to_accumulator(BinTrie::Node *node, CPU& cpu, void *data) {
+        auto &mem = cpu.get_memory();
+        auto word = mem.get_word(cpu.get_ip());
+        word.skip_bits(node->opcode_bitsize);
         bool w;
-        bs >> w;
-        uint16_t address = uint16_t(bs.read<8>().to_ulong() | bs.read<8>().to_ulong() << 8);
+        word >> w;
+        uint16_t address = uint16_t(word.read_bits<8>().to_ulong() |
+                mem.get_byte(cpu.get_ip() + 2).read_bits<8>().to_ulong() << 8);
         std::cout << node->name << " ax, [" << address << "]" << std::endl;
     }
-    void immediate_to_accumulator(BinTrie::Node *node, BinStream &bs, CPU& cpu, void *data) {
+    void immediate_to_accumulator(BinTrie::Node *node, CPU& cpu, void *data) {
+        auto &mem = cpu.get_memory();
+        auto word = mem.get_word(cpu.get_ip());
+        word.skip_bits(node->opcode_bitsize);
         bool w;
-        bs >> w;
+        word >> w;
         if (w) {
-            int16_t imm = bs.read<8>().to_ulong() | bs.read<8>().to_ulong() << 8;
+            int16_t imm = word.read_bits<8>().to_ulong() |
+                    mem.get_byte(cpu.get_ip() + 2).read_bits<8>().to_ulong() << 8;
             std::cout << node->name << " ax, " << imm << std::endl;
+            cpu.set_ip(cpu.get_ip() + 3);
         } else {
-            int8_t imm = int8_t(bs.read<8>().to_ulong());
+            int8_t imm = int8_t(word.read_bits<8>().to_ulong());
             std::cout << node->name << " al, " << int(imm) << std::endl;
+            cpu.set_ip(cpu.get_ip() + 2);
         }
     }
     const char *get_op_name(std::bitset<3> reg) {
@@ -879,34 +1000,49 @@ namespace x86 {
             default: return "ERROR";
         }
     }
-    void imm_to_register_memory_add(BinTrie::Node *node, BinStream &bs, CPU& cpu, void *data) {
+    void imm_to_register_memory_add(BinTrie::Node *node, CPU& cpu, void *data) {
+        auto &mem = cpu.get_memory();
+        auto word = mem.get_word(cpu.get_ip());
+        word.skip_bits(node->opcode_bitsize);
+        int ip_offset = 2;
         bool s = false, w = false;
         std::bitset<2> mod;
         std::bitset<3> reg, rm;
-        bs >> s;
-        bs >> w;
-        mod = bs.read<2>();
-        reg = bs.read<3>(); // always 000 for add
-        rm = bs.read<3>();
+        word >> s;
+        word >> w;
+        mod = word.read_bits<2>();
+        reg = word.read_bits<3>(); // always 000 for add
+        rm = word.read_bits<3>();
         int16_t possible_data = 0;
         int16_t possible_displacement = 0;
 
         Operand destination_op, source_op;
         if (mod.to_ulong() == 0b01) {
-            possible_displacement = int8_t(bs.read<8>().to_ulong());
+            auto byte = mem.get_byte(cpu.get_ip() + ip_offset);
+            ip_offset++;
+            possible_displacement = int8_t(byte.read_bits<8>().to_ulong());
             destination_op.set_type(Operand::eOperandType::Memory);
             destination_op.set_mem_or_imm(possible_displacement, false);
         } else if (mod.to_ulong() == 0b10 || (mod.to_ulong() == 0 && rm.to_ulong() == 0b110)) {
-            possible_displacement = int16_t(bs.read<8>().to_ulong() | bs.read<8>().to_ulong() << 8);
+            word = mem.get_word(cpu.get_ip() + ip_offset);
+            ip_offset += 2;
+            possible_displacement = int16_t(word.read_bits<8>().to_ulong() | word.read_bits<8>().to_ulong() << 8);
             destination_op.set_type(Operand::eOperandType::Memory);
             destination_op.set_mem_or_imm(possible_displacement, true);
         }
         if (!s && w) {
-            possible_data = int16_t(bs.read<8>().to_ulong() | bs.read<8>().to_ulong() << 8);
+            word = mem.get_word(cpu.get_ip() + ip_offset);
+            ip_offset += 2;
+            const int16_t lo = word.read_bits<8>().to_ulong();
+            const int16_t hi = word.read_bits<8>().to_ulong() << 8;
+            const int16_t value = hi | lo;
+            possible_data = value;
             source_op.set_mem_or_imm(possible_data, true);
             source_op.set_type(Operand::eOperandType::Immediate);
         } else {
-            possible_data = int8_t(bs.read<8>().to_ulong());
+            auto byte = mem.get_byte(cpu.get_ip() + ip_offset);
+            ip_offset++;
+            possible_data = int8_t(byte.read_bits<8>().to_ulong());
             source_op.set_mem_or_imm(possible_data, false);
             source_op.set_type(Operand::eOperandType::Immediate);
         }
@@ -943,6 +1079,7 @@ namespace x86 {
         }
         {
             cpu.remember_prev_state();
+            cpu.set_ip(cpu.get_ip() + ip_offset);
             cpu.set_effective_address_calculation(rm, mod);
             switch (reg.to_ulong()) {
                 case 0b000: cpu.add(destination_op, source_op); break;
@@ -953,8 +1090,109 @@ namespace x86 {
         }
         std::cout << std::endl;
     }
-    void conditional_jump(BinTrie::Node *node, BinStream &bs, CPU& cpu, void *data) {
-        std::cout << node->name << ' ' << int(bs.read<8>().to_ulong()) << std::endl;
+    void conditional_jump(BinTrie::Node *node, CPU& cpu, void *data) {
+        auto &mem = cpu.get_memory();
+        auto word = mem.get_word(cpu.get_ip());
+        word.skip_bits(node->opcode_bitsize);
+        cpu.remember_prev_state();
+        int8_t jump_offset = 2;
+        const auto &n = node->name;
+        const auto &flags = cpu.get_flags();
+        const int8_t offset = word.read_bits<8>().to_ulong();
+        if (n == "jnz" || n == "jne") {
+            if (!flags.get_zf()) {
+                jump_offset += offset;
+            }
+        } else if (n == "jz" || n == "je") {
+            if (flags.get_zf()) {
+                jump_offset += offset;
+            }
+        } else if (n == "js") {
+            if (flags.get_sf()) {
+                jump_offset += offset;
+            }
+        } else if (n == "jns") {
+            if (!flags.get_sf()) {
+                jump_offset += offset;
+            }
+        } else if (n == "jc") {
+            if (flags.get_cf()) {
+                jump_offset += offset;
+            }
+        } else if (n == "jnc") {
+            if (!flags.get_cf()) {
+                jump_offset += offset;
+            }
+        } else if (n == "jo") {
+            if (flags.get_of()) {
+                jump_offset += offset;
+            }
+        } else if (n == "jno") {
+            if (!flags.get_of()) {
+                jump_offset += offset;
+            }
+        } else if (n == "jp") {
+            if (flags.get_pf()) {
+                jump_offset += offset;
+            }
+        } else if (n == "jnp") {
+            if (!flags.get_pf()) {
+                jump_offset += offset;
+            }
+        } else if (n == "ja" || n == "jnbe") {
+            if (!flags.get_cf() && !flags.get_zf()) {
+                jump_offset += offset;
+            }
+        } else if (n == "jae" || n == "jnb" || n == "jnc") {
+            if (!flags.get_cf()) {
+                jump_offset += offset;
+            }
+        } else if (n == "jb" || n == "jnae" || n == "jc") {
+            if (flags.get_cf()) {
+                jump_offset += offset;
+            }
+        } else if (n == "jbe" || n == "jna") {
+            if (flags.get_cf() && flags.get_zf()) {
+                jump_offset += offset;
+            }
+        } else if (n == "jg" || n == "jnle") {
+            if (flags.get_of() == flags.get_sf() && !flags.get_zf()) {
+                jump_offset += offset;
+            }
+        } else if (n == "jge" || n == "jnl") {
+            if (flags.get_sf() == flags.get_of()) {
+                jump_offset += offset;
+            }
+        } else if (n == "jl" || n == "jnge") {
+            if (flags.get_sf() != flags.get_of()) {
+                jump_offset += offset;
+            }
+        } else if (n == "jle" || n == "jng") {
+            if (flags.get_of() != flags.get_sf() && flags.get_zf()) {
+                jump_offset += offset;
+            }
+        } else if (n == "jcxz") {
+            if (cpu.get_cx() == 0) {
+                jump_offset += offset;
+            }
+        } else if (n == "loopz" || n == "loope") {
+            const auto cur_cx = cpu.get_cx();
+            cpu.set_cx(cur_cx - 1);
+            if (cpu.get_cx() && flags.get_zf()) {
+                jump_offset += offset;
+            }
+        } else if (n == "loopnz" || n == "loopne") {
+            const auto cur_cx = cpu.get_cx();
+            cpu.set_cx(cur_cx - 1);
+            if (cpu.get_cx() && !flags.get_zf()) {
+                jump_offset += offset;
+            }
+        }
+        cpu.set_ip(cpu.get_ip() + jump_offset);
+        std::cout << node->name << " $";
+        if (offset > 0)
+            std::cout << '+';
+        std::cout << int(2+offset) << " ; " << cpu.state_change() << std::endl;
     }
 }
 
@@ -975,61 +1213,57 @@ int main(int argc, char **argv) {
         std::cout << "-f is a required argument\nusage: " << basename(argv[0]) << " -f <filename>" << std::endl;
         return 1;
     }
-
     x86::Memory memory(input_file);
-    x86::BinStream bs;
-    bs.init(memory, memory.get_size());
-
     x86::CPU cpu(memory);
-    x86::BinTrie commands(cpu);
-    commands.add(std::bitset<6>{0b100010},
+    x86::BinTrie &isa = cpu.get_isa();
+    isa.add(std::bitset<6>{0b100010},
                  "mov",
                  "register/memory to/from register",
                  x86::register_memory_to_from_register);
-    commands.add(std::bitset<4>{0b1011},
+    isa.add(std::bitset<4>{0b1011},
                  "mov",
                  "immediate to register",
                  x86::imm_to_register_move);
-    commands.add(std::bitset<7>{0b1100011},
+    isa.add(std::bitset<7>{0b1100011},
                  "mov",
                  "immediate to register/memory",
                  x86::imm_to_register_memory_move);
-    commands.add(std::bitset<7>{0b1010000},
+    isa.add(std::bitset<7>{0b1010000},
                  "mov",
                  "memory to accumulator",
                  x86::memory_to_accumulator);
-    commands.add(std::bitset<7>{0b1010001},
+    isa.add(std::bitset<7>{0b1010001},
                  "mov",
                  "accumulator to memory",
                  x86::accumulator_to_memory);
 
-    commands.add(std::bitset<6>{0b000000},
+    isa.add(std::bitset<6>{0b000000},
                  "add",
                  "reg/memory with register to either",
                  x86::register_memory_to_from_register);
-    commands.add(std::bitset<6>{0b100000},
+    isa.add(std::bitset<6>{0b100000},
                  "add",
                  "immediate to register/memory",
                  x86::imm_to_register_memory_add);
-    commands.add(std::bitset<7>{0b0000010},
+    isa.add(std::bitset<7>{0b0000010},
                  "add",
                  "immediate to accumulator",
                  x86::immediate_to_accumulator);
 
-    commands.add(std::bitset<6>{0b001010},
+    isa.add(std::bitset<6>{0b001010},
                  "sub",
                  "reg/memory with register to either",
                  x86::register_memory_to_from_register);
-    commands.add(std::bitset<7>{0b0010110},
+    isa.add(std::bitset<7>{0b0010110},
                  "sub",
                  "immediate to accumulator",
                  x86::immediate_to_accumulator);
 
-    commands.add(std::bitset<6>{0b001110},
+    isa.add(std::bitset<6>{0b001110},
                  "cmp",
                  "reg/memory with register to either",
                  x86::register_memory_to_from_register);
-    commands.add(std::bitset<7>{0b0011110},
+    isa.add(std::bitset<7>{0b0011110},
                  "cmp",
                  "immediate to accumulator",
                  x86::immediate_to_accumulator);
@@ -1058,16 +1292,11 @@ int main(int argc, char **argv) {
             {0b11100011, "jcxz"},
     };
     for (const auto &[opcode, name] : cond_jumps) {
-        commands.add(std::bitset<8>{opcode},
+        isa.add(std::bitset<8>{opcode},
                      name,
                      "jump equals",
                      x86::conditional_jump);
     }
-    bs.init(memory, memory.get_size());
-
-    // walk file
-    int instruction_n = 1;
-    while (instruction_n++, bs) {
-        commands.process_next_instruction(bs, nullptr);
-    }
+    std::cout << cpu.get_memory() << std::endl;
+    cpu.execute();
 }
