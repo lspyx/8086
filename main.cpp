@@ -77,6 +77,13 @@ namespace x86 {
 
     class Memory {
     public:
+        ~Memory() {
+            if (enable_dump_) {
+                for (int i = 0; i < 256*256; i++)
+                    std::clog << buffer_[i];
+                std::clog << std::endl;
+            }
+        }
         Memory() = default;
         explicit Memory(const std::string &input_file)
         : size_(load_input_file(input_file, buffer_))
@@ -92,6 +99,9 @@ namespace x86 {
         }
         size_t get_size() const {
             return size_;
+        }
+        void enable_dump() {
+            enable_dump_ = true;
         }
         friend
         std::ostream &operator<<(std::ostream& os, const Memory &mem) {
@@ -109,6 +119,7 @@ namespace x86 {
     private:
         char buffer_[256*256] = {0};
         size_t size_ = 0;
+        bool enable_dump_ = false;
         size_t load_input_file(const std::string &filename, char (&input_arr)[256*256]) {
             std::ifstream input(filename);
             if (input.bad() || !input.is_open())
@@ -1247,6 +1258,12 @@ namespace x86 {
             if (cpu.get_cx() && !flags.get_zf()) {
                 jump_offset += offset;
             }
+        } else if (n == "loop") {
+            const auto cur_cx = cpu.get_cx();
+            cpu.set_cx(cur_cx - 1);
+            if (cpu.get_cx()) {
+                jump_offset += offset;
+            }
         }
         cpu.set_ip(cpu.get_ip() + jump_offset);
         std::cout << node->name << " $";
@@ -1274,6 +1291,7 @@ int main(int argc, char **argv) {
         return 1;
     }
     x86::Memory memory(input_file);
+    memory.enable_dump();
     x86::CPU cpu(memory);
     x86::BinTrie &isa = cpu.get_isa();
     isa.add(std::bitset<6>{0b100010},
