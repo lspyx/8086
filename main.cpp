@@ -466,7 +466,7 @@ namespace x86 {
             dest = source.get_memory_or_immediate_s();
         }
         void mov_imm_to_mem(Operand destination, Operand source) {
-            const uint16_t address = calculate_effective_address(source.get_memory_or_immediate_s());
+            const uint16_t address = calculate_effective_address(destination.get_memory_or_immediate_s());
             uint16_t *dest = select_memory(address);
             *dest = source.get_memory_or_immediate_s();
         }
@@ -477,11 +477,15 @@ namespace x86 {
         }
         void mov(eInstructionType type, Operand destination, Operand source) {
             switch (type) {
-                case eInstructionType::RegisterMemoryToFromRegister:
-                {
-                    if (source.get_type() == Operand::eOperandType::Register) {
+                case eInstructionType::RegisterMemoryToFromRegister: {
+                    if (source.get_type() == Operand::eOperandType::Register &&
+                           destination.get_type() == Operand::eOperandType::Memory) {
+                        mov_reg_to_mem(destination, source);
+                    } else if (source.get_type() == Operand::eOperandType::Register &&
+                            destination.get_type() == Operand::eOperandType::Register) {
                         mov_reg_to_reg(destination, source);
-                    } else if (source.get_type() == Operand::eOperandType::Memory) {
+                    } else if (source.get_type() == Operand::eOperandType::Memory &&
+                            destination.get_type() == Operand::eOperandType::Register) {
                         mov_mem_to_reg(destination, source);
                     } else {
                         throw std::logic_error("Unknown mov operation 1");
@@ -554,12 +558,17 @@ namespace x86 {
         }
         void add(Operand destination, Operand source) {
             if (destination.get_type() == Operand::eOperandType::Register
-                && source.get_type() == Operand::eOperandType::Register)
-            {
+                && source.get_type() == Operand::eOperandType::Register) {
                 auto &dest = select_register(destination.get_register());
                 auto &src = select_register(source.get_register());
                 update_flags(true, dest, src);
                 dest += src;
+            } else if (destination.get_type() == Operand::eOperandType::Register
+                       && source.get_type() == Operand::eOperandType::Memory) {
+                uint16_t &dst = select_register(destination.get_register());
+                const uint16_t address = calculate_effective_address(source.get_memory_or_immediate_s());
+                const uint16_t *const src = select_memory(address);
+                dst += *src;
             } else {
                 assert(source.get_type() == Operand::eOperandType::Immediate);
                 auto &dest = select_register(destination.get_register());
@@ -846,21 +855,28 @@ namespace x86 {
                 source_op.set_register(reg, w);
             }
             std::cout << node->name << ' ' << dest << ", " << source;
-        } else {
+        } else { // mem to from reg
             int16_t possible_displacement = 0;
-            source_op.set_type(Operand::eOperandType::Memory);
-            if (mod.to_ulong() == 0b01) {
-                auto byte = mem.get_byte(cpu.get_ip() + 2);
-                ip_offset++;
-                possible_displacement = int8_t(byte.read_bits<8>().to_ulong());
-                source_op.set_mem_or_imm(possible_displacement, false);
-            } else if (mod.to_ulong() == 0b10 || (mod.to_ulong() == 0 && rm.to_ulong() == 0b110)) {
-                word = mem.get_word(cpu.get_ip() + 2);
-                ip_offset += 2;
-                possible_displacement = int16_t(word.read_bits<8>().to_ulong() | word.read_bits<8>().to_ulong() << 8);
-                source_op.set_mem_or_imm(possible_displacement, true);
-            }
             if (d) { // load: mov ax, [86]
+                if (mod.to_ulong() == 0b01) {
+                    auto byte = mem.get_byte(cpu.get_ip() + 2);
+                    ip_offset++;
+                    possible_displacement = int8_t(byte.read_bits<8>().to_ulong());
+                    source_op.set_type(Operand::eOperandType::Memory);
+                    source_op.set_mem_or_imm(possible_displacement, false);
+                } else if (mod.to_ulong() == 0b10 || (mod.to_ulong() == 0 && rm.to_ulong() == 0b110)) {
+                    word = mem.get_word(cpu.get_ip() + 2);
+                    ip_offset += 2;
+                    possible_displacement = int16_t(word.read_bits<8>().to_ulong() | word.read_bits<8>().to_ulong() << 8);
+                    source_op.set_type(Operand::eOperandType::Memory);
+                    source_op.set_mem_or_imm(possible_displacement, true);
+                } else if (mod.to_ulong() == 0b0) {
+                    source_op.set_type(Operand::eOperandType::Memory);
+                    source_op.set_mem_or_imm(0, false);
+                } else if (mod.to_ulong() == 0b11) {
+                    source_op.set_type(Operand::eOperandType::Register);
+                    source_op.set_register(rm, w);
+                }
                 std::cout << node->name
                           << ' '
                           << get_register_name(reg, w)
@@ -875,6 +891,25 @@ namespace x86 {
                 destination_op.set_type(Operand::eOperandType::Register);
                 destination_op.set_register(reg, w);
             } else { // store: mov [86], ax
+                if (mod.to_ulong() == 0b01) {
+                    auto byte = mem.get_byte(cpu.get_ip() + 2);
+                    ip_offset++;
+                    possible_displacement = int8_t(byte.read_bits<8>().to_ulong());
+                    destination_op.set_type(Operand::eOperandType::Memory);
+                    destination_op.set_mem_or_imm(possible_displacement, false);
+                } else if (mod.to_ulong() == 0b10 || (mod.to_ulong() == 0 && rm.to_ulong() == 0b110)) {
+                    word = mem.get_word(cpu.get_ip() + 2);
+                    ip_offset += 2;
+                    possible_displacement = int16_t(word.read_bits<8>().to_ulong() | word.read_bits<8>().to_ulong() << 8);
+                    destination_op.set_type(Operand::eOperandType::Memory);
+                    destination_op.set_mem_or_imm(possible_displacement, true);
+                } else if (mod.to_ulong() == 0b0) {
+                    destination_op.set_type(Operand::eOperandType::Memory);
+                    destination_op.set_mem_or_imm(0, false);
+                } else if (mod.to_ulong() == 0b11) {
+                    destination_op.set_type(Operand::eOperandType::Register);
+                    destination_op.set_register(rm, w);
+                }
                 std::cout << node->name
                           << " ["
                           << get_displacement_rm(rm, mod);
@@ -885,7 +920,8 @@ namespace x86 {
                 }
                 std::cout << "], "
                           << get_register_name(reg, w);
-
+                source_op.set_type(Operand::eOperandType::Register);
+                source_op.set_register(reg, w);
             }
         }
         {
@@ -920,14 +956,25 @@ namespace x86 {
         rm = word.read_bits<3>();
         int16_t possible_data = 0;
         int16_t possible_displacement = 0;
+
+        Operand destination, source;
+        source.set_type(Operand::eOperandType::Immediate);
+        eInstructionType type = eInstructionType::ImmediateToRegisterMemory;
         if (mod.to_ulong() == 0b01) {
             auto byte = mem.get_byte(cpu.get_ip() + ip_offset);
             ip_offset++;
             possible_displacement = int8_t(byte.read_bits<8>().to_ulong());
+            destination.set_type(Operand::eOperandType::Memory);
+            destination.set_mem_or_imm(possible_displacement, false);
         } else if (mod.to_ulong() == 0b10 || (mod.to_ulong() == 0 && rm.to_ulong() == 0b110)) {
             word = mem.get_word(cpu.get_ip() + ip_offset);
             ip_offset += 2;
             possible_displacement = int16_t(word.read_bits<8>().to_ulong() | word.read_bits<8>().to_ulong() << 8);
+            destination.set_type(Operand::eOperandType::Memory);
+            destination.set_mem_or_imm(possible_displacement, true);
+        } else {
+            destination.set_type(Operand::eOperandType::Register);
+            destination.set_register(rm, w);
         }
         if (w) {
             word = mem.get_word(cpu.get_ip() + ip_offset);
@@ -938,19 +985,32 @@ namespace x86 {
             ip_offset++;
             possible_data = int8_t(byte.read_bits<8>().to_ulong());
         }
+        source.set_mem_or_imm(possible_data, w);
         std::cout << node->name
                   << " ["
                   << get_displacement_rm(rm, mod);
         if (possible_displacement != 0) {
-            std::cout << ' '
-                      << (possible_displacement < 0 ? '-' : '+')
-                      << ' ' << std::abs(possible_displacement);
+            const bool direct_address = rm.to_ulong() == 0b110 && mod.to_ulong() == 0;
+            if (direct_address) {
+                std::cout << std::abs(possible_displacement);
+            } else {
+                std::cout << ' '
+                          << (possible_displacement < 0 ? '-' : '+')
+                          << ' ' << std::abs(possible_displacement);
+            }
         }
         std::cout << "], "
                   << (w ? "word " : "byte ")
-                  << possible_data
-                  << std::endl;
-        cpu.set_ip(cpu.get_ip() + ip_offset);
+                  << possible_data;
+        {
+            cpu.set_effective_address_calculation(rm, mod);
+            cpu.remember_prev_state();
+            cpu.set_ip(cpu.get_ip() + ip_offset);
+            cpu.mov(type, destination, source);
+            std::cout << " ; " << cpu.state_change();
+        }
+        std::cout << std::endl;
+
     }
 
     void accumulator_to_memory(BinTrie::Node *node, CPU& cpu, void *data) {
