@@ -10,10 +10,89 @@
 #include <getopt.h>
 #include <cassert>
 #include <map>
-#include <sstream>
 #include <iomanip>
 
 namespace x86 {
+    class ClockCounter {
+    public:
+        enum class eEACType {
+            Null = 0,
+            BaseOrIndexOnly = 5,
+            DisplacementOnly = 6,
+            DisplacementPlusBasePlusIndexBPDIOrBXSI = 7,
+            DisplacementPlusBasePlusIndexBPSIOrBXDI = 8,
+            DisplacementPlusBaseOrIndex = 9,
+            DisplacementPlusBaseOrIndexBPDIOrBXSI = 11,
+            DisplacementPlusBaseOrIndexBPSIOrBXDI = 12
+        };
+        enum class eFlowType {
+            Null = 0,
+            RegisterFromRegister,
+            RegisterFromMemory,
+            MemoryFromRegister,
+            RegisterFromImmediate,
+            MemoryFromImmediate,
+            AccumulatorFromImmediate,
+
+            MemoryFromAccumulator,
+            AccumulatorFromMemory,
+            SegRegFromReg16,
+            SegRegFromMem16,
+            Reg16FromSegReg,
+            MemoryFromSegReg
+        };
+        void add(int n) {
+            if (n == 17) {
+                [](){}();
+            }
+            n_clocks_ += n;
+            last_add_ = n;
+        }
+        int get() const {
+            return n_clocks_;
+        }
+        int effective_address_calculation_clocks(eEACType eac_type) {
+            return int(eac_type);
+        }
+        int add_clocks(eFlowType flow_type, eEACType eac_type) {
+            switch (flow_type) {
+                case eFlowType::Null: return 0;
+                case eFlowType::RegisterFromRegister: return 3;
+                case eFlowType::RegisterFromMemory: return 9 + effective_address_calculation_clocks(eac_type);
+                case eFlowType::MemoryFromRegister: return 16 + effective_address_calculation_clocks(eac_type);
+                case eFlowType::RegisterFromImmediate: return 4;
+                case eFlowType::MemoryFromImmediate: return 17 + effective_address_calculation_clocks(eac_type);
+                case eFlowType::AccumulatorFromImmediate: return 4;
+                default: throw std::invalid_argument("this flow_type value is not supported in add");
+            }
+        }
+        int mov_clocks(eFlowType flow_type, eEACType eac_type) {
+            switch (flow_type) {
+                case eFlowType::Null: return 0;
+                case eFlowType::MemoryFromAccumulator: return 10;
+                case eFlowType::AccumulatorFromMemory: return 10;
+                case eFlowType::RegisterFromRegister: return 2;
+                case eFlowType::RegisterFromMemory: return 8 + effective_address_calculation_clocks(eac_type);
+                case eFlowType::MemoryFromRegister: return 9 + effective_address_calculation_clocks(eac_type);
+                case eFlowType::RegisterFromImmediate: return 4;
+                case eFlowType::MemoryFromImmediate: return 10 + effective_address_calculation_clocks(eac_type);
+                case eFlowType::SegRegFromReg16: return 2;
+                case eFlowType::SegRegFromMem16: return 8 + effective_address_calculation_clocks(eac_type);
+                case eFlowType::Reg16FromSegReg: return 2;
+                case eFlowType::MemoryFromSegReg: return 9 + effective_address_calculation_clocks(eac_type);
+                default: throw std::invalid_argument("this flow_type value is not supported in mov");
+            }
+        }
+        std::string str() const {
+            std::stringstream ss;
+            ss << "Clocks: (+" << last_add_ << ") = " << n_clocks_;
+            return ss.str();
+        }
+    private:
+        int n_clocks_ = 0;
+        int last_add_ = 0;
+    };
+
     class IterableByte {
     public:
         IterableByte(uint8_t val) : value(val) {}
@@ -454,6 +533,34 @@ namespace x86 {
                 case eEffectiveAddressCalculation::BXplusD16: return bx + int16_t(offset);
             }
         }
+        ClockCounter::eEACType map_eac() {
+            switch (eac_) {
+                case eEffectiveAddressCalculation::BXplusSI: return ClockCounter::eEACType::DisplacementPlusBaseOrIndexBPDIOrBXSI;
+                case eEffectiveAddressCalculation::BXplusDI: return ClockCounter::eEACType::DisplacementPlusBaseOrIndexBPSIOrBXDI;
+                case eEffectiveAddressCalculation::BPplusSI: return ClockCounter::eEACType::DisplacementPlusBaseOrIndexBPSIOrBXDI;
+                case eEffectiveAddressCalculation::BPplusDI: return ClockCounter::eEACType::DisplacementPlusBaseOrIndexBPDIOrBXSI;
+                case eEffectiveAddressCalculation::SI: return ClockCounter::eEACType::BaseOrIndexOnly;
+                case eEffectiveAddressCalculation::DI: return ClockCounter::eEACType::BaseOrIndexOnly;
+                case eEffectiveAddressCalculation::DirectAdress: return ClockCounter::eEACType::DisplacementOnly;
+                case eEffectiveAddressCalculation::BX: return ClockCounter::eEACType::BaseOrIndexOnly;
+                case eEffectiveAddressCalculation::BXplusSIplusD8: return ClockCounter::eEACType::DisplacementPlusBasePlusIndexBPDIOrBXSI;
+                case eEffectiveAddressCalculation::BXplusDIplusD8: return ClockCounter::eEACType::DisplacementPlusBasePlusIndexBPSIOrBXDI;
+                case eEffectiveAddressCalculation::BPplusSIplusD8: return ClockCounter::eEACType::DisplacementPlusBasePlusIndexBPSIOrBXDI;
+                case eEffectiveAddressCalculation::BPplusDIplusD8: return ClockCounter::eEACType::DisplacementPlusBasePlusIndexBPDIOrBXSI;
+                case eEffectiveAddressCalculation::SIplusD8: return ClockCounter::eEACType::DisplacementPlusBaseOrIndex;
+                case eEffectiveAddressCalculation::DIplusD8: return ClockCounter::eEACType::DisplacementPlusBaseOrIndex;
+                case eEffectiveAddressCalculation::BPplusD8: return ClockCounter::eEACType::DisplacementPlusBaseOrIndex;
+                case eEffectiveAddressCalculation::BXplusD8: return ClockCounter::eEACType::DisplacementPlusBaseOrIndex;
+                case eEffectiveAddressCalculation::BXplusSIplusD16: return ClockCounter::eEACType::DisplacementPlusBasePlusIndexBPDIOrBXSI;
+                case eEffectiveAddressCalculation::BXplusDIplusD16: return ClockCounter::eEACType::DisplacementPlusBasePlusIndexBPSIOrBXDI;
+                case eEffectiveAddressCalculation::BPplusSIplusD16: return ClockCounter::eEACType::DisplacementPlusBasePlusIndexBPSIOrBXDI;
+                case eEffectiveAddressCalculation::BPplusDIplusD16: return ClockCounter::eEACType::DisplacementPlusBasePlusIndexBPDIOrBXSI;
+                case eEffectiveAddressCalculation::SIplusD16: return ClockCounter::eEACType::DisplacementPlusBaseOrIndex;
+                case eEffectiveAddressCalculation::DIplusD16: return ClockCounter::eEACType::DisplacementPlusBaseOrIndex;
+                case eEffectiveAddressCalculation::BPplusD16: return ClockCounter::eEACType::DisplacementPlusBaseOrIndex;
+                case eEffectiveAddressCalculation::BXplusD16: return ClockCounter::eEACType::DisplacementPlusBaseOrIndex;
+            }
+        }
         uint16_t &select_register(eArchRegister the_reg) {
             static uint16_t * const arr[8] = {&ax, &cx, &dx, &bx, &sp, &bp, &si, &di};
             return *arr[int(the_reg) % 8];
@@ -465,26 +572,33 @@ namespace x86 {
             uint16_t &dst = select_register(destination.get_register());
             const uint16_t &src = select_register(source.get_register());
             dst = src;
+            clock_counter_.add(clock_counter_.mov_clocks(ClockCounter::eFlowType::RegisterFromRegister,
+                                                         ClockCounter::eEACType::Null));
         }
         void mov_mem_to_reg(Operand destination, Operand source) {
             uint16_t &dst = select_register(destination.get_register());
             const uint16_t address = calculate_effective_address(source.get_memory_or_immediate_s());
             const uint16_t *const src = select_memory(address);
             dst = *src;
+            clock_counter_.add(clock_counter_.mov_clocks(ClockCounter::eFlowType::RegisterFromMemory, map_eac()));
         }
         void mov_imm_to_reg(Operand destination, Operand source) {
             uint16_t &dest = select_register(destination.get_register());
             dest = source.get_memory_or_immediate_s();
+            clock_counter_.add(clock_counter_.mov_clocks(ClockCounter::eFlowType::RegisterFromImmediate,
+                                                         ClockCounter::eEACType::Null));
         }
         void mov_imm_to_mem(Operand destination, Operand source) {
             const uint16_t address = calculate_effective_address(destination.get_memory_or_immediate_s());
             uint16_t *dest = select_memory(address);
             *dest = source.get_memory_or_immediate_s();
+            clock_counter_.add(clock_counter_.mov_clocks(ClockCounter::eFlowType::MemoryFromImmediate, map_eac()));
         }
         void mov_reg_to_mem(Operand destination, Operand source) {
             const uint16_t address = calculate_effective_address(destination.get_memory_or_immediate_s());
             uint16_t *dest = select_memory(address);
             *dest = select_register(source.get_register());
+            clock_counter_.add(clock_counter_.mov_clocks(ClockCounter::eFlowType::MemoryFromRegister, map_eac()));
         }
         void mov(eInstructionType type, Operand destination, Operand source) {
             switch (type) {
@@ -574,18 +688,29 @@ namespace x86 {
                 auto &src = select_register(source.get_register());
                 update_flags(true, dest, src);
                 dest += src;
+                clock_counter_.add(clock_counter_.add_clocks(
+                        ClockCounter::eFlowType::RegisterFromRegister, ClockCounter::eEACType::Null));
             } else if (destination.get_type() == Operand::eOperandType::Register
                        && source.get_type() == Operand::eOperandType::Memory) {
                 uint16_t &dst = select_register(destination.get_register());
                 const uint16_t address = calculate_effective_address(source.get_memory_or_immediate_s());
                 const uint16_t *const src = select_memory(address);
                 dst += *src;
+                clock_counter_.add(clock_counter_.add_clocks(ClockCounter::eFlowType::RegisterFromMemory, map_eac()));
+            } else if (destination.get_type() == Operand::eOperandType::Memory
+                       && source.get_type() == Operand::eOperandType::Register) {
+                const uint16_t src = select_register(destination.get_register());
+                const uint16_t address = calculate_effective_address(source.get_memory_or_immediate_s());
+                uint16_t * dst = select_memory(address);
+                dst += src;
+                clock_counter_.add(clock_counter_.add_clocks(ClockCounter::eFlowType::MemoryFromRegister, map_eac()));
             } else {
                 assert(source.get_type() == Operand::eOperandType::Immediate);
                 auto &dest = select_register(destination.get_register());
                 auto src = source.get_memory_or_immediate_s();
                 update_flags(true, dest, src);
                 dest += src;
+                clock_counter_.add(clock_counter_.add_clocks(ClockCounter::eFlowType::RegisterFromImmediate, ClockCounter::eEACType::Null));
             }
         }
         void cmp(Operand destination, Operand source) {
@@ -683,6 +808,8 @@ namespace x86 {
             if (ip != pip)
                 ss << " ip = 0x" << std::hex << pip
                    << " -> 0x" << std::hex << ip;
+
+            ss << " ; " << clock_counter_.str();
             return ss.str();
         }
         std::string state() {
@@ -707,6 +834,7 @@ namespace x86 {
                << std::dec << '(' << int(ip) << ')' << '\n';
             const std::string cur_state = flags.str();
             ss << "\tflags = " << cur_state;
+            ss << " ; " << clock_counter_.str();
             return ss.str();
         }
         uint16_t get_ip() {
@@ -730,7 +858,7 @@ namespace x86 {
         eEffectiveAddressCalculation eac_;
         Flags pflags, flags;
         BinTrie isa_;
-
+        ClockCounter clock_counter_;
     };
 
     template<typename T>
@@ -1291,7 +1419,7 @@ int main(int argc, char **argv) {
         return 1;
     }
     x86::Memory memory(input_file);
-    memory.enable_dump();
+    // memory.enable_dump();
     x86::CPU cpu(memory);
     x86::BinTrie &isa = cpu.get_isa();
     isa.add(std::bitset<6>{0b100010},
@@ -1375,6 +1503,6 @@ int main(int argc, char **argv) {
                      "jump equals",
                      x86::conditional_jump);
     }
-    std::cout << cpu.get_memory() << std::endl;
+    // std::cout << cpu.get_memory() << std::endl;
     cpu.execute();
 }
